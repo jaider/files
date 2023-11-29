@@ -1,0 +1,279 @@
+ import {
+    observable,
+    action,
+    toJS,
+    IComputedValue,
+    runInAction,
+    comparer,
+    makeObservable,
+} from 'mobx';
+import { getFieldState, FilterInfo, convertToJSValue, FilterTypes } from '../utils/filter-models';
+import { FormState, FieldState } from 'formstate';
+import { commitFormState, isFormStateChanged } from '@servicetitan/form';
+import { debounce } from 'debounce';
+
+const TTL = 12 * 60 * 60 * 1000;
+const expiryField = 'expiry';
+const filterRegex = /st:pb:[^:]+:filters:.*/;
+export type FilterType =
+    | 'Service'
+    | 'Material'
+    | 'Equipment'
+    | 'ProposalTemplates'
+    | 'Categories'
+    | 'ServiceUpdates'
+    | 'ServiceDismissedUpdates'
+    | 'EquipmentUpdates'
+    | 'EquipmentDismissedUpdates'
+    | 'MaterialUpdates'
+    | 'MaterialDismissedUpdates'
+    | 'CategoryUpdates'
+    | 'CategoryDismissedUpdates'
+    | 'EquipmentTypes'
+    | 'EquipmentSystems'
+    | 'ClientSpecificRules'
+    | 'InsuranceRates'
+    | 'DynamicPricingRules'
+    | 'ServiceHistory'
+    | 'MaterialHistory'
+    | 'EquipmentHistory'
+    | 'CategoryHistory'
+    | 'SmartStartService';
+type DebounceFn = (() => void) & {
+    clear(): void;
+};
+
+@injectable()
+export class FiltersStore {
+    @observable
+    fields = new Map<string, FieldState<any>>();
+
+    @observable
+    defaults = new Map<string, any>();
+
+    @observable
+    form: FormState<any>;
+
+    @observable
+    resetToggle = false;
+
+    @observable
+    selectedFilters = new Map<string, any>();
+
+    @observable
+    hasChanged = false;
+
+    @observable
+    changedValues = new Set<string>();
+
+    @observable
+    filtersInUse = new Set<string>();
+
+    @observable
+    filterType?: FilterType;
+
+    private formsChanged?: IComputedValue<boolean>;
+
+    private delayApply?: DebounceFn;
+
+    private delaySaveState?: DebounceFn;
+
+    private selectedFiltersChangedCallback?: () => void;
+
+    constructor() {
+        makeObservable(this);
+        this.form = new FormState<any>(this.fields);
+
+        if (!window.AppUser.clearPricebookFilters) {
+            window.AppUser.clearPricebookFilters = () => {
+                try {
+                    const matches: string[] = [];
+                    for (let index = 0; index < localStorage.length; index++) {
+                        const key = localStorage.key(index);
+                        if (key && filterRegex.test(key)) {
+                            matches.push(key);
+                        }
+                    }
+                    matches.forEach(key => localStorage.removeItem(key));
+                } catch {
+                    // do nothing
+                }
+            };
+        }
+    }
+
+    @action
+    setFilterType = (filterType: FilterType) => {
+        if (!this.filterType) {
+            this.filterType = filterType;
+        }
+    };
+
+    get canClose() {
+        return this.filtersInUse.size === 0;
+    }
+
+    @action
+    attach(filter: FilterInfo) {
+        const field = filter.field!;
+        if (this.fields.has(field)) {
+            return this.fields.get(field);
+        }
+
+        const fieldState = getFieldState(filter.type);
+        this.defaults.set(field, fieldState.$);
+        this.fields.set(field, fieldState);
+
+        const expiryKey = this.getStorageKey(expiryField);
+        const expiryStr = localStorage.getItem(expiryKey);
+        const fieldKey = this.getStorageKey(field);
+        if (expiryStr) {
+            const expiry = JSON.parse(expiryStr);
+            const now = new Date();
+            if (now.getTime() > expiry) {
+                localStorage.removeItem(fieldKey);
+            }
+        }
+
+        const savedValue = localStorage.getItem(fieldKey);
+        if (savedValue) {
+            const jsonValue = JSON.parse(savedValue);
+            const value = convertToJSValue(jsonValue, filter.type);
+            (fieldState as FieldState<any>).onChange(value);
+            this.delayApply?.clear();
+            this.delayApply = debounce(() => this.apply(false), 200);
+            this.delayApply();
+        }
+        this.delaySaveState?.clear();
+        this.delaySaveState = debounce(() => this.saveState(), 10);
+        this.delaySaveState();
+
+        fieldState.onUpdate(() => {
+            this.reportChange(field);
+        });
+        return fieldState;
+    }
+
+    @action
+    resetAll = () => {
+        this.defaults.forEach((value, field) => this.fields.get(field)!.onChange(value));
+        this.resetToggle = !this.resetToggle; // this force the category to clear out
+    };
+
+    /** Reset to previous committedState */
+    @action
+    cancel = () => {
+        this.form?.reset();
+        this.resetToggle = !this.resetToggle; // this force the category to clear out
+    };
+
+    @action
+    apply = (resetStorage: boolean) => {
+        const selectedFilters = new Map<string, any>();
+        this.fields.forEach((fieldState, field) => {
+            const fieldKey = this.getStorageKey(field);
+            if (this.changedValues.has(field)) {
+                selectedFilters.set(field, toJS(fieldState.$));
+                if (resetStorage) {
+                    localStorage.setItem(fieldKey, JSON.stringify(fieldState.$));
+                }
+            } else {
+                if (resetStorage) {
+                    localStorage.removeItem(fieldKey);
+                }
+            }
+        });
+
+        if (resetStorage) {
+            const expiryKey = this.getStorageKey(expiryField);
+            if (selectedFilters.size > 0) {
+                const now = new Date();
+                const expiry = now.getTime() + TTL;
+                localStorage.setItem(expiryKey, JSON.stringify(expiry));
+            } else {
+                localStorage.removeItem(expiryKey);
+            }
+        }
+
+        this.selectedFilters = selectedFilters;
+        this.selectedFiltersChangedCallback?.();
+        this.saveState();
+        this.reportChange();
+    };
+
+    @action
+    setInUse(name: string, inUse: boolean) {
+        if (inUse && !this.filtersInUse.has(name)) {
+            this.filtersInUse.add(name);
+        }
+        if (!inUse && this.filtersInUse.has(name)) {
+            this.filtersInUse.delete(name);
+        }
+    }
+
+    @action
+    init = async (fields: [string, FilterTypes][]) => {
+        this.form.disableAutoValidation();
+        this.attachAll(fields);
+        this.delayApply?.clear();
+        this.delaySaveState?.clear();
+    };
+
+    restore = async () => {
+        await this.form.enableAutoValidationAndValidate();
+        this.apply(false);
+    };
+
+    attachAll = (fields: [string, FilterTypes][]) => {
+        fields.forEach(([field, type]) => {
+            this.attach({ field, type });
+        });
+    };
+
+    @action
+    resetState = () => {
+        this.fields = new Map<string, FieldState<any>>();
+        this.defaults = new Map<string, any>();
+        this.form = new FormState<any>(this.fields);
+        this.resetToggle = false;
+        this.selectedFilters = new Map<string, any>();
+        this.hasChanged = false;
+        this.changedValues = new Set<string>();
+        this.filtersInUse = new Set<string>();
+        this.formsChanged = undefined;
+        this.filterType = undefined;
+
+        this.selectedFiltersChangedCallback?.();
+    };
+
+    @action
+    setCallback = (callback: () => void) => {
+        this.selectedFiltersChangedCallback = callback;
+    };
+
+    private isValueChanged = <T>(field: string, fieldState: FieldState<T>) => {
+        return !comparer.structural(this.defaults.get(field)!, fieldState.value);
+    };
+
+    @action
+    private saveState = () => {
+        commitFormState(this.form);
+        this.formsChanged = isFormStateChanged(this.form);
+    };
+
+    private reportChange(field?: string) {
+        runInAction(() => {
+            this.hasChanged = this.formsChanged?.get() ?? false;
+            if (field) {
+                const fieldHasChanged = this.isValueChanged(field, this.fields.get(field)!);
+                if (fieldHasChanged) {
+                    this.changedValues.add(field);
+                } else {
+                    this.changedValues.delete(field);
+                }
+            }
+        });
+    }
+
+    private getStorageKey = (field: string) => `st:pb:${this.filterType!}:filters:${field}`;
+}
